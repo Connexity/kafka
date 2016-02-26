@@ -121,6 +121,12 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
         .describedAs("A list of topic:partition pairs to source from")
         .ofType(classOf[String])
 
+      val topicMappingOpt = parser.accepts("topic.mapping.list",
+        "List of topic mappings.")
+        .withRequiredArg()
+        .describedAs("A list of topic mappings")
+        .ofType(classOf[String])
+
       val blacklistOpt = parser.accepts("blacklist",
         "Blacklist of topics to mirror. Only old consumer supports blacklist.")
         .withRequiredArg()
@@ -153,7 +159,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
         .ofType(classOf[String])
 
       val messageHandlerArgsOpt = parser.accepts("message.handler.args",
-        "Arguments used by custom rebalance listener for mirror maker consumer")
+        "Arguments used by custom message handler for mirror maker consumer")
         .withRequiredArg()
         .describedAs("Arguments passed to message handler constructor.")
         .ofType(classOf[String])
@@ -213,7 +219,17 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
       // Always set producer key and value serializer to ByteArraySerializer.
       producerProps.setProperty(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer")
       producerProps.setProperty(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer")
-      producer = new MirrorMakerProducer(producerProps)
+
+      val topicMappings: Map[String, String] = if (options.has(topicMappingOpt)) {
+        (options.valueOf(topicMappingOpt).split(",").toList map { case tp =>
+          val parts = tp.split(":")
+          parts(0) -> parts(1)
+        }).toMap
+      } else {
+        Map.empty
+      }
+
+      producer = new MirrorMakerProducer(producerProps, topicMappings)
 
       // Create consumers
       val mirrorMakerConsumers = if (!useNewConsumer) {
@@ -605,18 +621,27 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
     }
   }
 
-  private class MirrorMakerProducer(val producerProps: Properties) {
+  private class MirrorMakerProducer(val producerProps: Properties, val topicMapping: Map[String, String]) {
 
     val sync = producerProps.getProperty("producer.type", "async").equals("sync")
 
     val producer = new KafkaProducer[Array[Byte], Array[Byte]](producerProps)
 
     def send(record: ProducerRecord[Array[Byte], Array[Byte]]) {
-      if (sync) {
-        this.producer.send(record).get()
+
+      val convertedRecord = if (topicMapping.nonEmpty) {
+        // if topic mapping is used, then we will not honor partition from original topic
+        val targetTopic = if (topicMapping contains record.topic()) topicMapping(record.topic()) else record.topic()
+        new ProducerRecord[Array[Byte], Array[Byte]](targetTopic, record.key(), record.value())
       } else {
-          this.producer.send(record,
-            new MirrorMakerProducerCallback(record.topic(), record.key(), record.value()))
+        record
+      }
+
+      if (sync) {
+        this.producer.send(convertedRecord).get()
+      } else {
+          this.producer.send(convertedRecord,
+            new MirrorMakerProducerCallback(convertedRecord.topic(), convertedRecord.key(), convertedRecord.value()))
       }
     }
 
@@ -669,5 +694,6 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
       Collections.singletonList(new ProducerRecord[Array[Byte], Array[Byte]](record.topic, record.key, record.value))
     }
   }
-
 }
+
+
