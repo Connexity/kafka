@@ -26,22 +26,22 @@ import java.util.{Collections, Properties}
 import com.yammer.metrics.core.Gauge
 import joptsimple.OptionParser
 import kafka.client.ClientUtils
-import kafka.consumer.{BaseConsumerRecord, ConsumerIterator, BaseConsumer, Blacklist, ConsumerConfig, ConsumerThreadId, ConsumerTimeoutException, TopicFilter, Whitelist, ZookeeperConsumerConnector}
+import kafka.consumer.{BaseConsumer, BaseConsumerRecord, Blacklist, ConsumerConfig, ConsumerIterator, ConsumerThreadId, ConsumerTimeoutException, TopicFilter, Whitelist, ZookeeperConsumerConnector}
 import kafka.javaapi.consumer.ConsumerRebalanceListener
 import kafka.message.MessageAndMetadata
 import kafka.metrics.KafkaMetricsGroup
 import kafka.serializer.DefaultDecoder
 import kafka.utils.{CommandLineUtils, CoreUtils, Logging}
-import org.apache.kafka.clients.consumer.{OffsetAndMetadata, Consumer, ConsumerRecord, KafkaConsumer}
+import org.apache.kafka.clients.consumer.{Consumer, ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
 import org.apache.kafka.clients.producer.internals.ErrorLoggingCallback
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord, RecordMetadata}
 import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.errors.WakeupException
 import org.apache.kafka.common.serialization.ByteArrayDeserializer
 import org.apache.kafka.common.utils.Utils
-import org.apache.kafka.common.errors.WakeupException
 
 import scala.collection.JavaConversions._
-import scala.collection.mutable.HashMap
+import scala.collection.mutable
 import scala.util.control.ControlThrowable
 
 /**
@@ -116,15 +116,15 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
         .ofType(classOf[String])
 
       val topicPartitionOpt = parser.accepts("topic.partition.list",
-        "List of topic:partition to mirror.")
+        "List of topic:partitions to mirror.")
         .withRequiredArg()
-        .describedAs("A list of topic:partition pairs to source from")
+        .describedAs("Topic:partitions config string. Example: topicA:1-3,6,7;topicB:1,4-9")
         .ofType(classOf[String])
 
-      val topicMappingOpt = parser.accepts("topic.mapping.list",
-        "List of topic mappings.")
+      val topicMappingOpt = parser.accepts("topic.mapping.prop",
+        "Topic mapping property file.")
         .withRequiredArg()
-        .describedAs("A list of topic mappings")
+        .describedAs("Topic mapping property file")
         .ofType(classOf[String])
 
       val blacklistOpt = parser.accepts("blacklist",
@@ -220,13 +220,10 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
       producerProps.setProperty(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer")
       producerProps.setProperty(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer")
 
-      val topicMappings: Map[String, String] = if (options.has(topicMappingOpt)) {
-        (options.valueOf(topicMappingOpt).split(",").toList map { case tp =>
-          val parts = tp.split(":")
-          parts(0) -> parts(1)
-        }).toMap
+      val topicMappings: java.util.Map[String, String] = if (options.has(topicMappingOpt)) {
+        Utils.propsToStringMap(Utils.loadProps(options.valueOf(topicMappingOpt)))
       } else {
-        Map.empty
+        Collections.emptyMap()
       }
 
       producer = new MirrorMakerProducer(producerProps, topicMappings)
@@ -541,7 +538,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
     // TODO: we need to manually maintain the consumed offsets for new consumer
     // since its internal consumed position is updated in batch rather than one
     // record at a time, this can be resolved when we break the unification of both consumers
-    private val offsets = new HashMap[TopicPartition, Long]()
+    private val offsets = new mutable.HashMap[TopicPartition, Long]()
 
     override def init() {
       debug("Initiating new consumer")
@@ -550,9 +547,21 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
         consumer.subscribe(Pattern.compile(whitelistOpt.get), consumerRebalanceListener)
 
       } else if (topicPartitions.isDefined) {
-        val topicPartitionPairs = topicPartitions.get.split(",").toList map { case tp =>
-          val parts = tp.split(":")
-          new TopicPartition(parts(0), parts(1).toInt)
+
+        // examples: topicA:1-3,6,7;topicB:1,4-9
+        val topicPartitionPairs = new util.ArrayList[TopicPartition]()
+        topicPartitions.get.split(";").toList foreach { case tp =>
+          val Array(topic, partitionList) = tp.split(":")
+          partitionList.split(",") foreach { partitions =>
+            if (partitions.indexOf('-') > 0) {
+              val Array(start, end) = partitions.split("-")
+              start.toInt to end.toInt foreach { partition =>
+                topicPartitionPairs.add(new TopicPartition(topic, partition))
+              }
+            } else {
+              topicPartitionPairs.add(new TopicPartition(topic, partitions.toInt))
+            }
+          }
         }
         consumer.assign(topicPartitionPairs)
       }
@@ -621,7 +630,7 @@ object MirrorMaker extends Logging with KafkaMetricsGroup {
     }
   }
 
-  private class MirrorMakerProducer(val producerProps: Properties, val topicMapping: Map[String, String]) {
+  private class MirrorMakerProducer(val producerProps: Properties, val topicMapping: java.util.Map[String, String]) {
 
     val sync = producerProps.getProperty("producer.type", "async").equals("sync")
 
